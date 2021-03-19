@@ -15,7 +15,12 @@ const EtchTokenScanner = struct {
         /// Copy `n` bytes to the output buffer
         RawSequence: usize,
         /// Append the variable to the output buffer
-        Variable: []const u8,
+        Variable: struct {
+            /// Variable path to trace through the provided arguments struct
+            path: []const u8,
+            /// Size of the variable definition to skip in the original input string
+            size: usize,
+        },
         /// Insert the literal char for the variable start sequence
         EscapedVariableToken,
     };
@@ -24,7 +29,8 @@ const EtchTokenScanner = struct {
     head: usize = 0,
     input: []const u8,
 
-    current_variable_idx: ?usize = null,
+    current_variable_begin_idx: ?usize = null,
+    current_variable_path_idx: ?usize = null,
 
     fn cur(self: Self) u8 {
         return self.input[self.head];
@@ -34,7 +40,7 @@ const EtchTokenScanner = struct {
         return self.head >= self.input.len;
     }
 
-    fn next(self: *Self) !?Token {
+    fn next(comptime self: *Self) !?Token {
         while (!self.isDone()) {
             switch (self.state) {
                 .ReadingVariable => {
@@ -58,10 +64,13 @@ const EtchTokenScanner = struct {
                             }
                             self.state = .TopLevel;
                             self.head += 1;
-                            if (self.current_variable_idx) |idx| {
-                                const token = Token{ .Variable = self.input[idx..var_end_idx] };
-                                self.current_variable_idx = null;
-                                return token;
+                            if (self.current_variable_begin_idx) |var_beg_idx| {
+                                if (self.current_variable_path_idx) |var_path_beg_idx| {
+                                    const token = Token{ .Variable = .{ .path = self.input[var_path_beg_idx..var_end_idx], .size = self.head - var_beg_idx } };
+                                    self.current_variable_begin_idx = null;
+                                    self.current_variable_path_idx = null;
+                                    return token;
+                                } else return error.NoVariablePathProvided;
                             } else return error.TemplateVariableEndWithoutBeginning;
                         }
                         self.head += 1;
@@ -78,7 +87,7 @@ const EtchTokenScanner = struct {
                             if (cur_char == VARIABLE_END_CHAR)
                                 return error.NoVariablePathProvided;
                             if (cur_char == VARIABLE_PATH_CHAR) {
-                                self.current_variable_idx = self.head;
+                                self.current_variable_path_idx = self.head;
                                 self.state = .ReadingVariable;
                                 self.head += 1;
                                 break;
@@ -92,6 +101,7 @@ const EtchTokenScanner = struct {
                     while (!self.isDone()) {
                         if (self.cur() == VARIABLE_START_CHAR) {
                             self.state = .BeginReadingVariable;
+                            self.current_variable_begin_idx = self.head;
                             self.head += 1;
                             break;
                         }
@@ -144,9 +154,7 @@ fn lookupPath(comptime arguments: anytype, comptime path: []const u8) StructVari
                 if (comptime std.mem.eql(u8, ptr.name, item)) {
                     if (ptr.default_value) |val| {
                         return StructVariable{ .String = val };
-                        // @compileLog(@typeInfo(ptr.field_type));
-                        // return val;
-                    } else @compileLog("Unable to get length of field '" ++ item ++ "', is it null?");
+                    } else @compileError("Unable to get length of field '" ++ item ++ "', is it null?");
                 } else @compileError("Item '" ++ item ++ "' does not exist on provided struct");
             }
         }
@@ -164,7 +172,7 @@ fn getSizeNeededForTemplate(comptime input: []const u8, arguments: anytype) !usi
     while (try scanner.next()) |token| {
         bytesNeeded += switch (token) {
             .RawSequence => |s| s,
-            .Variable => |v| switch (lookupPath(arguments, v)) {
+            .Variable => |v| switch (lookupPath(arguments, v.path)) {
                 .String => |item| item.len,
             },
             .EscapedVariableToken => 1,
@@ -174,37 +182,44 @@ fn getSizeNeededForTemplate(comptime input: []const u8, arguments: anytype) !usi
     return bytesNeeded;
 }
 
-fn etchBuf(buf: []u8, comptime input: []const u8, arguments: anytype) !void {
+pub fn etchBuf(buf: []u8, comptime input: []const u8, arguments: anytype) []u8 {
     comptime var scanner = EtchTokenScanner{
         .input = input,
     };
-    comptime var head: usize = 0;
+    comptime var input_ptr: usize = 0;
+    comptime var buf_ptr: usize = 0;
     inline while (comptime try scanner.next()) |token| {
-        comptime var move_amt = 0;
+        comptime var input_move_amt = 0;
+        comptime var buf_move_amt = 0;
         switch (token) {
             .RawSequence => |s| {
-                move_amt = s;
-                std.mem.copy(u8, buf[head .. head + s], input[head .. head + s]);
+                input_move_amt = s;
+                buf_move_amt = s;
+                std.mem.copy(u8, buf[buf_ptr .. buf_ptr + s], input[input_ptr .. input_ptr + s]);
             },
             .Variable => |v| {
-                comptime const variable = lookupPath(arguments, v);
+                comptime const variable = lookupPath(arguments, v.path);
+                input_move_amt = v.size;
                 switch (variable) {
                     .String => |item| {
-                        move_amt = item.len;
-                        std.mem.copy(u8, buf[head .. head + item.len], item[0..]);
+                        buf_move_amt = item.len;
+                        std.mem.copy(u8, buf[buf_ptr .. buf_ptr + item.len], item[0..]);
                     },
                 }
             },
             .EscapedVariableToken => {
-                move_amt = 1;
-                buf[head] = VARIABLE_START_CHAR;
+                input_move_amt = 2;
+                buf_move_amt = 1;
+                buf[buf_ptr] = VARIABLE_START_CHAR;
             },
         }
-        head += move_amt;
+        input_ptr += input_move_amt;
+        buf_ptr += buf_move_amt;
     }
+    return buf[0..buf_ptr];
 }
 
-pub fn etch(allocator: *std.mem.Allocator, comptime input: []const u8, arguments: anytype) ![]const u8 {
+pub fn etch(allocator: *std.mem.Allocator, comptime input: []const u8, arguments: anytype) ![]u8 {
     const bytesNeeded = comptime getSizeNeededForTemplate(input, arguments) catch |e| {
         switch (e) {
             .UnfinishedVariableDeclaration => @compileError("Reached end of template input, but found unfinished variable declaration"),
@@ -213,8 +228,7 @@ pub fn etch(allocator: *std.mem.Allocator, comptime input: []const u8, arguments
         }
     };
     var buf = try allocator.alloc(u8, bytesNeeded);
-    try etchBuf(buf, input, arguments);
-    return buf;
+    return etchBuf(buf, input, arguments);
 }
 
 test "basic interpolation" {
@@ -222,8 +236,12 @@ test "basic interpolation" {
 
     var timer = try std.time.Timer.start();
 
-    const out = try etch(testing.allocator, "Hello, { .person.name.first } { .person.name.last }", .{ .person = .{ .name = .{ .first = "Haze", .last = "Booth" } } });
+    const out = try etch(
+        testing.allocator,
+        "Hello, { .person.name.first } {{ { .person.name.last }",
+        .{ .butt = "cumsicle", .person = .{ .name = .{ .first = "Haze", .last = "Booth" } } },
+    );
     defer testing.allocator.free(out);
 
-    std.log.warn("out=\"{s}\" in={}ns", .{ out, timer.lap() });
+    testing.expectEqualStrings(out, "Hello, Haze { Booth");
 }
