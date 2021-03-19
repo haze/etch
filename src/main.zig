@@ -1,5 +1,8 @@
-// NOTE(haze): Uncomment @compileError's
-
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2021 Haze Booth
+// This file is part of [etch](https://github.com/haze/etch), which is MIT licensed.
+// The MIT license requires this copyright notice to be included in all copies
+// and substantial portions of the software.
 const std = @import("std");
 const testing = std.testing;
 
